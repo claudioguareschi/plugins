@@ -1,0 +1,225 @@
+#!/usr/local/bin/python3
+
+"""
+    Copyright (c) 2026 Claudio Guareschi <cguareschimd@gmail.com>
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+    INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+    AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY,
+    OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+    -------------------------------------------------------------------------------------------------------
+    Force refresh the given accounts (comma separated uuids), output a json result per account.
+
+    The detected address is sent to the service, even when it equals the cached one. The running backend
+    determines how:
+        * native (ddclient_opn.py): the request is queued to the running poller, which owns the status file.
+        * ddclient: the daemon is stopped, `ddclient -force -host <hostnames>` runs once for the accounts
+          hostnames and the daemon is started again, so only one ddclient process writes the cache at a time.
+          ddclient does not lock its cache and reports a single exit status for all hosts, the per account
+          outcome is therefore read from the cache after the run.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import syslog
+import time
+from xml.etree import ElementTree
+from lib.poller import RequestQueue
+
+TIMEOUT = 100
+CONFIG_XML = '/conf/config.xml'
+LOCK_FILE = '/var/run/ddclient_force.lock'
+NATIVE_PID_FILE = '/var/run/ddclient_opn.pid'
+PID_FILE = '/var/run/ddclient.pid'
+ACCOUNTS_FILE = '/usr/local/etc/ddclient.json'
+CONF_FILE = '/usr/local/etc/ddclient.conf'
+CACHE_FILE = '/var/tmp/ddclient.cache'
+DDCLIENT = '/usr/local/sbin/ddclient'
+RC_SCRIPT = '/usr/local/etc/rc.d/ddclient'
+
+
+def pid_running(pidfile):
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def native_force(account_ids):
+    queue = RequestQueue()
+    request_id = queue.submit(account_ids)
+    response = queue.wait(request_id, TIMEOUT)
+    if response is None:
+        # withdraw when not yet picked up, otherwise the outcome will only be logged
+        queue.cancel(request_id)
+        response = {}
+    return {x: response.get(x, {'status': 'failed', 'reason': 'timeout'}) for x in account_ids}
+
+
+def ddclient_hosts(filename):
+    """ map account uuids to hostnames, ddclient.json is generated together with ddclient.conf and
+        contains the same (enabled) accounts and hostnames
+    """
+    try:
+        with open(filename) as f:
+            accounts = json.load(f).get('accounts', [])
+    except (OSError, ValueError):
+        return {}
+    result = {}
+    for account in accounts:
+        if 'id' in account:
+            result[account['id']] = [x.strip() for x in account.get('hostnames', '').split(',') if x.strip() != '']
+    return result
+
+
+def explain_inactive(result, filename):
+    """ the backends only know enabled accounts of the applied configuration, use the configuration to
+        explain why an account is not active (disabled, not applied yet or not configured at all)
+    """
+    inactive = [x for x in result if result[x].get('reason') == 'unknown_account']
+    if inactive:
+        try:
+            accounts = ElementTree.parse(filename).getroot().findall('./OPNsense/DynDNS/accounts/account')
+        except (OSError, ElementTree.ParseError):
+            accounts = []
+        enabled = {x.get('uuid'): x.findtext('enabled') == '1' for x in accounts}
+        for account_id in inactive:
+            if account_id in enabled:
+                result[account_id]['reason'] = 'not_applied' if enabled[account_id] else 'disabled'
+
+
+def ddclient_cache(filename):
+    """ read ddclient cache, return dict (host => properties)
+    """
+    result = {}
+    if os.path.isfile(filename):
+        with open(filename) as f:
+            for line in f:
+                parts = line.strip().split(' ')
+                if line.startswith('#') or len(parts) < 2:
+                    continue
+                result[parts[-1]] = dict(x.split('=', 1) for x in parts[0].split(',') if '=' in x)
+    return result
+
+
+def ddclient_force(account_ids, pid):
+    result = {}
+    all_hosts = ddclient_hosts(ACCOUNTS_FILE)
+    hosts = []
+    for account_id in account_ids:
+        if account_id in all_hosts:
+            hosts += [x for x in all_hosts[account_id] if x not in hosts]
+        else:
+            result[account_id] = {'status': 'failed', 'reason': 'unknown_account'}
+    if not hosts:
+        return result
+
+    # stop the daemon gracefully (finishes a running update cycle), ddclient does not lock its cache
+    deadline = time.time() + TIMEOUT
+    os.kill(pid, signal.SIGTERM)
+    while pid_running(PID_FILE) == pid and time.time() < deadline - TIMEOUT / 2:
+        time.sleep(0.1)
+    if pid_running(PID_FILE) == pid:
+        for account_id in account_ids:
+            result.setdefault(account_id, {'status': 'failed', 'reason': 'timeout'})
+        return result
+
+    started = int(time.time())
+    try:
+        syslog.syslog(syslog.LOG_NOTICE, "force refresh requested for %s" % ','.join(hosts))
+        subprocess.run(
+            [
+                # ddclient.conf does not set daemon (the interval is passed by the rc script), so this is a single run
+                DDCLIENT, '-foreground', '-force', '-file', CONF_FILE, '-cache', CACHE_FILE,
+                '-host', ','.join(hosts)
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=max(deadline - time.time(), 10)
+        )
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # restore the daemon, unless it has been started by someone else in the meantime
+        if pid_running(PID_FILE):
+            syslog.syslog(syslog.LOG_NOTICE, "force refresh ddclient already running, not restarted")
+        elif subprocess.run([RC_SCRIPT, 'start'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            syslog.syslog(syslog.LOG_ERR, "force refresh unable to restart ddclient")
+
+    cache = ddclient_cache(CACHE_FILE)
+    for account_id in account_ids:
+        if account_id in result:
+            continue
+        ip = None
+        for host in all_hosts[account_id]:
+            entry = cache.get(host, {})
+            statuses = [entry[x] for x in ['status', 'status-ipv4', 'status-ipv6'] if entry.get(x)]
+            if 'good' not in statuses or int(entry.get('mtime') or 0) < started:
+                result[account_id] = {'status': 'failed', 'reason': 'update_failed'}
+                break
+            ip = entry.get('ip') or entry.get('ipv4') or entry.get('ipv6')
+            if not ip:
+                result[account_id] = {'status': 'failed', 'reason': 'no_address'}
+                break
+        else:
+            result[account_id] = {'status': 'ok', 'ip': ip}
+        syslog.syslog(
+            syslog.LOG_NOTICE if result[account_id]['status'] == 'ok' else syslog.LOG_ERR,
+            "force refresh %s for %s" % (
+                'succeeded' if result[account_id]['status'] == 'ok' else 'failed', ','.join(all_hosts[account_id])
+            )
+        )
+    return result
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('accounts', help='account uuids (comma separated)')
+    args = parser.parse_args()
+    syslog.openlog('ddclient', facility=syslog.LOG_LOCAL4)
+
+    result = {}
+    account_ids = []
+    for account_id in dict.fromkeys([x.strip() for x in args.accounts.split(',') if x.strip() != '']):
+        if re.match(r'^[0-9a-fA-F-]{36}$', account_id):
+            account_ids.append(account_id)
+        else:
+            result[account_id] = {'status': 'failed', 'reason': 'unknown_account'}
+
+    if account_ids:
+        # serialize force requests, the legacy path restarts the daemon
+        with open(LOCK_FILE, 'a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            ddclient_pid = pid_running(PID_FILE)
+            if pid_running(NATIVE_PID_FILE):
+                result.update(native_force(account_ids))
+            elif ddclient_pid:
+                result.update(ddclient_force(account_ids, ddclient_pid))
+            else:
+                result.update({x: {'status': 'failed', 'reason': 'not_running'} for x in account_ids})
+        explain_inactive(result, CONFIG_XML)
+
+    print(json.dumps(result))

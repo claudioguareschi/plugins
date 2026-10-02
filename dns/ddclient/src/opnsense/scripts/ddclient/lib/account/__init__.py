@@ -40,6 +40,7 @@ class BaseAccount:
         self._state = {}
         self._last_accessed = 0
         self._current_address = None   # last resolved address
+        self.force = False             # bypass cached address check on next execute()
 
         # calculate a hash so we can easily detect configuration changes
         hash_list = []
@@ -129,6 +130,7 @@ class BaseAccount:
             )
             return False
         elif (
+                self.force or
                 self._state.get('ip') is None or
                 self._current_address != self._state.get('ip') or
                 self.state.get('md5') != self.md5

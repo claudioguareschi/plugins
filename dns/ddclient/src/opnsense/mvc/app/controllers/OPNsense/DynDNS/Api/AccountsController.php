@@ -81,4 +81,75 @@ class AccountsController extends ApiMutableModelControllerBase
     {
         return $this->toggleBase("accounts.account", $uuid, $enabled);
     }
+
+    /**
+     * Detect the current address and push it to the service, even when it equals the cached one.
+     * @param string $uuids comma separated list of account uuids
+     * @return array status (ok, failed or error) and the result per account (ok, failed or error)
+     */
+    public function forceRefreshAction($uuids = null)
+    {
+        $result = ['status' => 'failed'];
+        if (!$this->request->isPost()) {
+            return $result;
+        }
+
+        $uuids = array_values(array_unique(array_filter(array_map('trim', explode(',', $uuids ?? '')))));
+        if (empty($uuids)) {
+            $result['message'] = gettext('No accounts selected.');
+            return $result;
+        }
+        foreach ($uuids as $uuid) {
+            if (!preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $uuid)) {
+                $result['message'] = gettext('Invalid account.');
+                return $result;
+            }
+        }
+
+        $messages = [
+            'unknown_account' => gettext('Account not found.'),
+            'disabled' => gettext('Account is disabled.'),
+            'not_applied' => gettext('Account is not active, apply the configuration first.'),
+            'not_running' => gettext('The Dynamic DNS service is not running.'),
+            'no_address' => gettext('No global IP address detected.'),
+            'update_failed' => gettext('Update rejected or failed, see the log for details.'),
+            'timeout' => gettext('No result received in time, see the log for details.'),
+        ];
+        $unexpected = gettext('Unexpected error, see the log for details.');
+
+        $response = (new Backend())->configdpRun('ddclient force_refresh', [implode(',', $uuids)]);
+        $response = json_decode($response ?? '', true);
+        if (!is_array($response)) {
+            $result['status'] = 'error';
+            $result['message'] = $unexpected;
+            return $result;
+        }
+
+        $mdl = $this->getModel();
+        $result['status'] = 'ok';
+        foreach ($uuids as $uuid) {
+            $outcome = is_array($response[$uuid] ?? null) ? $response[$uuid] : [];
+            $node = $mdl->getNodeByReference('accounts.account.' . $uuid);
+            $account = ['description' => $uuid];
+            if ($node != null) {
+                $account['description'] = (string)$node->description ?: (string)$node->hostnames;
+            }
+            if (($outcome['status'] ?? '') == 'ok') {
+                $account['status'] = 'ok';
+                $account['ip'] = (string)($outcome['ip'] ?? '');
+            } elseif (($outcome['status'] ?? '') == 'failed' && isset($messages[$outcome['reason'] ?? ''])) {
+                $account['status'] = 'failed';
+                $account['message'] = $messages[$outcome['reason']];
+            } else {
+                $account['status'] = 'error';
+                $account['message'] = $unexpected;
+            }
+            if ($account['status'] != 'ok') {
+                $result['status'] = 'failed';
+            }
+            $result['accounts'][$uuid] = $account;
+        }
+
+        return $result;
+    }
 }

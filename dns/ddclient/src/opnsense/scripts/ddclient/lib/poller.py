@@ -32,7 +32,11 @@ import os
 import time
 import ujson
 import ipaddress
+import uuid
 from .account import BaseAccount
+
+
+REQUEST_PATH = '/var/run/ddclient_opn.requests'
 
 
 class AccountFactory:
@@ -74,10 +78,100 @@ class AccountFactory:
         return all_services
 
 
+class RequestQueue:
+    """ Simple file based queue to pass force refresh requests to the running poller.
+        A client drops a request (<id>.req) containing the account ids to refresh, the poller claims it,
+        executes the requested accounts and writes the outcome to <id>.res, which the client collects.
+        All files are written to a temporary name first and renamed into place, so readers never see
+        partial content.
+    """
+    # requests older than this are not executed anymore, nobody is waiting for the result
+    request_ttl = 120
+    # leftovers (uncollected results, files of an interrupted client or poller) are removed after this
+    cleanup_ttl = 3600
+
+    def __init__(self, path=REQUEST_PATH):
+        self._path = path
+
+    def _filename(self, request_id, ext):
+        return "%s/%s.%s" % (self._path, request_id, ext)
+
+    def _write(self, filename, data):
+        tmp_filename = "%s.tmp" % filename
+        with open(tmp_filename, 'w') as f:
+            f.write(ujson.dumps(data))
+        os.rename(tmp_filename, filename)
+
+    def submit(self, account_ids):
+        """ queue a request, return its id
+        """
+        os.makedirs(self._path, mode=0o700, exist_ok=True)
+        # a .run file only exists between claiming and reading a request, never while it executes
+        for filename in glob.glob("%s/*" % self._path):
+            try:
+                if time.time() - os.path.getmtime(filename) > self.cleanup_ttl:
+                    os.remove(filename)
+            except FileNotFoundError:
+                pass
+        request_id = uuid.uuid4().hex
+        self._write(self._filename(request_id, 'req'), list(account_ids))
+        return request_id
+
+    def cancel(self, request_id):
+        """ withdraw a request, return false when the poller has already claimed it
+        """
+        try:
+            os.remove(self._filename(request_id, 'req'))
+            return True
+        except FileNotFoundError:
+            return False
+
+    def wait(self, request_id, timeout):
+        """ wait for the result of a request, return None on timeout
+        """
+        filename = self._filename(request_id, 'res')
+        until = time.time() + timeout
+        while time.time() < until:
+            if os.path.isfile(filename):
+                with open(filename) as f:
+                    result = ujson.load(f)
+                os.remove(filename)
+                return result
+            time.sleep(0.5)
+        return None
+
+    def pending(self):
+        """ claim and yield all queued requests as (request_id, [account_ids])
+        """
+        for filename in glob.glob("%s/*.req" % self._path):
+            request_id = os.path.basename(filename)[:-4]
+            claimed_filename = self._filename(request_id, 'run')
+            try:
+                os.rename(filename, claimed_filename)
+            except FileNotFoundError:
+                # cancelled by the client
+                continue
+            try:
+                with open(claimed_filename) as f:
+                    account_ids = ujson.load(f)
+            except ValueError:
+                account_ids = None
+            expired = time.time() - os.path.getmtime(claimed_filename) > self.request_ttl
+            os.remove(claimed_filename)
+            if expired:
+                syslog.syslog(syslog.LOG_NOTICE, "force refresh request %s expired, ignored" % request_id)
+            elif type(account_ids) is list and all(type(x) is str for x in account_ids):
+                yield request_id, account_ids
+
+    def respond(self, request_id, result):
+        self._write(self._filename(request_id, 'res'), result)
+
+
 class Poller:
-    def __init__(self, config_filename, status_filename):
+    def __init__(self, config_filename, status_filename, request_path=REQUEST_PATH):
         self._config_filename = config_filename
         self._status_filename = status_filename
+        self._requests = RequestQueue(request_path)
         self._accounts = {}
         self._general_settings = {}
         syslog.openlog('ddclient', facility=syslog.LOG_LOCAL4)
@@ -144,27 +238,79 @@ class Poller:
         fhandle.write(ujson.dumps(data))
         fhandle.close()
 
+    def execute_account(self, acc, force=False):
+        """ execute account check/update sequence
+            :param acc: account object
+            :param force: push the detected address to the service, even when it equals the cached one
+            :return: True when updated, False when not modified or failed, None on fatal error
+        """
+        if self.is_verbose:
+            syslog.syslog(syslog.LOG_NOTICE, "Account %s executing" % acc.description)
+        acc.force = force
+        try:
+            if acc.execute():
+                if self.is_verbose:
+                    syslog.syslog(syslog.LOG_NOTICE, "Account %s updated" % acc.description)
+                return True
+            else:
+                if self.is_verbose:
+                    syslog.syslog(syslog.LOG_NOTICE, "Account %s not modified" % acc.description)
+                # update last accessed timestamp
+                acc.update_state(None)
+                return False
+        except Exception as e:
+            # fatal exception, update atime so we're not going to retry too soon
+            acc.update_state(None)
+            syslog.syslog(syslog.LOG_ERR, "Account %s raised fatal error (%s)" % (acc.description, e))
+            return None
+        finally:
+            acc.force = False
+
+    def process_requests(self):
+        """ handle queued force refresh requests, status is flushed before responding so the
+            result is persisted by the time the client receives it.
+        """
+        for request_id, account_ids in self._requests.pending():
+            result = {}
+            needs_flush = False
+            for acc_id in dict.fromkeys(account_ids):
+                acc = self._accounts.get(acc_id)
+                if acc is None:
+                    result[acc_id] = {'status': 'failed', 'reason': 'unknown_account'}
+                    continue
+                syslog.syslog(syslog.LOG_NOTICE, "Account %s force refresh requested" % acc.description)
+                updated = self.execute_account(acc, force=True)
+                if updated:
+                    needs_flush = True
+                    syslog.syslog(
+                        syslog.LOG_NOTICE,
+                        "Account %s force refresh succeeded (%s)" % (acc.description, acc.state.get('ip'))
+                    )
+                    result[acc_id] = {'status': 'ok', 'ip': acc.state.get('ip')}
+                elif updated is None:
+                    # unexpected error, already logged by execute_account()
+                    result[acc_id] = {'status': 'error'}
+                else:
+                    reason = 'update_failed' if acc.current_address else 'no_address'
+                    syslog.syslog(
+                        syslog.LOG_ERR, "Account %s force refresh failed (%s)" % (acc.description, reason)
+                    )
+                    result[acc_id] = {'status': 'failed', 'reason': reason}
+            if needs_flush:
+                self.flush_status()
+            self._requests.respond(request_id, result)
+
     def run(self):
         while True:
+            try:
+                self.process_requests()
+            except OSError as e:
+                syslog.syslog(syslog.LOG_ERR, "Unable to process force refresh requests (%s)" % e)
             needs_flush = False
             for acc in self._accounts.values():
                 if time.time() - acc.atime > self.poll_interval:
-                    if self.is_verbose:
-                        syslog.syslog(syslog.LOG_NOTICE, "Account %s executing" % acc.description)
-                    try:
-                        if acc.execute():
-                            if self.is_verbose:
-                                syslog.syslog(syslog.LOG_NOTICE, "Account %s updated" % acc.description)
-                            needs_flush = True
-                        else:
-                            if self.is_verbose:
-                                syslog.syslog(syslog.LOG_NOTICE, "Account %s not modified" % acc.description)
-                            # update last accessed timestamp
-                            acc.update_state(None)
-                    except Exception as e:
-                        # fatal exception, update atime so we're not going to retry too soon
-                        acc.update_state(None)
-                        syslog.syslog(syslog.LOG_ERR, "Account %s raised fatal error (%s)" % (acc.description, e))
+                    if self.execute_account(acc):
+                        needs_flush = True
 
             if needs_flush:
                 if self.is_verbose:

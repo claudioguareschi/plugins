@@ -29,13 +29,71 @@ POSSIBILITY OF SUCH DAMAGE.
 <script>
 
     $( document ).ready(function() {
+        /**
+         * force refresh the given accounts, the grid shows the result, failures and errors are reported in a dialog
+         */
+        function forceRefresh(uuids, $icon) {
+            if (uuids.length === 0 || $icon.hasClass('fa-spin')) {
+                // nothing selected or still running
+                return;
+            }
+            $icon.addClass('fa-spin');
+            ajaxCall('/api/dyndns/accounts/force_refresh/' + uuids.join(','), {}, function (data, status) {
+                $icon.removeClass('fa-spin');
+                $("#grid-accounts").bootgrid('reload');
+                const valid = status === 'success' && data !== undefined;
+                if (valid && data.status === 'ok') {
+                    return;
+                }
+                let $msg = $('<ul class="list-unstyled"/>');
+                let type = valid && data.status !== 'error' ? 'warning' : 'danger';
+                $.each(valid && data.accounts ? data.accounts : {}, function (uuid, account) {
+                    if (account.status !== 'ok') {
+                        type = account.status === 'error' ? 'danger' : type;
+                        $msg.append($('<li/>').append($('<b/>').text(account.description || uuid)).append(': ').append(
+                            $('<span/>').text(account.message)
+                        ));
+                    }
+                });
+                if ($msg.children().length === 0) {
+                    $msg.append($('<li/>').text(
+                        valid && data.message ? data.message : "{{ lang._('Unexpected error, see the log for details.') }}"
+                    ));
+                }
+                stdDialogInform("{{ lang._('Force refresh') }}", $msg, "{{ lang._('Close') }}", undefined, type);
+            });
+        }
+
         $("#grid-accounts").UIBootgrid(
             {   search:'/api/dyndns/accounts/search_item',
                 get:'/api/dyndns/accounts/get_item/',
                 set:'/api/dyndns/accounts/set_item/',
                 add:'/api/dyndns/accounts/add_item/',
                 del:'/api/dyndns/accounts/del_item/',
-                toggle:'/api/dyndns/accounts/toggle_item/'
+                toggle:'/api/dyndns/accounts/toggle_item/',
+                commands: {
+                    force_refresh: {
+                        method: function () {
+                            forceRefresh([$(this).data('row-id')], $(this).find('span'));
+                        },
+                        filter: function (cell) {
+                            return cell.getData().enabled === '1';
+                        },
+                        classname: 'fa fa-fw fa-refresh',
+                        title: "{{ lang._('Force refresh') }}",
+                        sequence: 50
+                    },
+                    force_refresh_selected: {
+                        method: function () {
+                            forceRefresh($("#grid-accounts").bootgrid('getSelectedRows'), $(this).find('span'));
+                        },
+                        classname: 'fa fa-fw fa-refresh',
+                        title: "{{ lang._('Force refresh selected') }}",
+                        footer: true,
+                        primary: true,
+                        sequence: 350
+                    }
+                }
             }
         );
         let data_get_map = {'frm_settings':"/api/dyndns/settings/get"};
@@ -111,7 +169,7 @@ POSSIBILITY OF SUCH DAMAGE.
                 <th data-column-id="current_ip" data-type="string">{{ lang._('Current IP') }}</th>
                 <th data-column-id="current_mtime" data-type="string">{{ lang._('Updated') }}</th>
                 <th data-column-id="description" data-type="string">{{ lang._('Description') }}</th>
-                <th data-column-id="commands" data-width="7em" data-formatter="commands" data-sortable="false">{{ lang._('Commands') }}</th>
+                <th data-column-id="commands" data-width="9em" data-formatter="commands" data-sortable="false">{{ lang._('Commands') }}</th>
             </tr>
             </thead>
             <tbody>
